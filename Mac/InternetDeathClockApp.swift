@@ -112,7 +112,9 @@ struct ContentView: View {
     @ObservedObject var presenter: DeathClockPresenter
     @AppStorage("scope") private var scope: Scope = .all
     @AppStorage("tab") private var tab: Tab = .today
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    // Read in onAppear: an initial value here is re-evaluated on every rebuild, and
+    // SMAppService.status is a blocking call to a system daemon.
+    @State private var launchAtLogin = false
     @State private var hovered: String?
 
     private var slices: [Slice] {
@@ -171,7 +173,9 @@ struct ContentView: View {
             HStack {
                 Toggle("Open at login", isOn: $launchAtLogin)
                     .toggleStyle(.checkbox)
+                    .onAppear { launchAtLogin = SMAppService.mainApp.status == .enabled }
                     .onChange(of: launchAtLogin) { _, on in
+                        guard on != (SMAppService.mainApp.status == .enabled) else { return }
                         do { on ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister() }
                         catch { launchAtLogin = SMAppService.mainApp.status == .enabled }
                     }

@@ -54,7 +54,10 @@ enum ActivityProbe {
         _ = AXIsProcessTrustedWithOptions(opts)
     }
 
-    /// Walks the focused window's UI tree (skipping web content) for the address bar.
+    /// The address bar found last time, so most samples are a couple of AX calls instead of a tree walk.
+    private static var cachedAddressBar: (pid: pid_t, window: AXUIElement, field: AXUIElement)?
+
+    /// Reads the address bar of the focused window, searching for it only when the window changes.
     private static func addressBarURL(pid: pid_t) -> String? {
         guard accessibilityTrusted else {
             if !accessibilityMissing { requestAccessibility() }  // prompt once per launch
@@ -66,6 +69,28 @@ enum ActivityProbe {
         AXUIElementSetMessagingTimeout(app, 0.25)
         guard let window: AXUIElement = axAttr(app, kAXFocusedWindowAttribute) else { return nil }
 
+        if let c = cachedAddressBar, c.pid == pid, CFEqual(c.window, window) {
+            var value: AnyObject?
+            // Any error here means the element is gone; fall through and search again.
+            if AXUIElementCopyAttributeValue(c.field, kAXValueAttribute as CFString, &value) == .success {
+                return url(fromAddressBar: value as? String)
+            }
+        }
+        cachedAddressBar = nil
+        guard let field = findAddressBar(in: window) else { return nil }
+        cachedAddressBar = (pid, window, field)
+        return url(fromAddressBar: axAttr(field, kAXValueAttribute))
+    }
+
+    /// Empty, or the user is mid-typing a search: nil, so the app name is used instead.
+    private static func url(fromAddressBar value: String?) -> String? {
+        guard let value, !value.isEmpty, !value.contains(" ") else { return nil }
+        // Firefox trims "https://" from the displayed URL.
+        return value.contains("://") || value.hasPrefix("about:") ? value : "https://" + value
+    }
+
+    /// Walks the window's UI tree (skipping web content) for the address bar.
+    private static func findAddressBar(in window: AXUIElement) -> AXUIElement? {
         var queue = [window]
         var visited = 0
         while !queue.isEmpty, visited < 400 {
@@ -76,13 +101,7 @@ enum ActivityProbe {
             if role == "AXComboBox" || role == "AXTextField" {
                 let desc: String = axAttr(el, kAXDescriptionAttribute) ?? ""
                 let ident: String = axAttr(el, "AXIdentifier") ?? ""
-                if desc.localizedCaseInsensitiveContains("address") || ident == "urlbar-input" {
-                    // Empty, or the user is mid-typing a search: fall back to the app name.
-                    guard let value: String = axAttr(el, kAXValueAttribute), !value.isEmpty,
-                          !value.contains(" ") else { return nil }
-                    // Firefox trims "https://" from the displayed URL.
-                    return value.contains("://") || value.hasPrefix("about:") ? value : "https://" + value
-                }
+                if desc.localizedCaseInsensitiveContains("address") || ident == "urlbar-input" { return el }
             }
             queue += (axAttr(el, kAXChildrenAttribute) as [AXUIElement]?) ?? []
         }

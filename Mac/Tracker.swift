@@ -36,11 +36,27 @@ final class Tracker: ObservableObject {
     static let pollInterval: TimeInterval = 2
     /// Gaps longer than this between samples (sleep, idle, lock) split activity.
     static let maxGap: TimeInterval = 10
+    /// The UI shows minutes, so while you stay on one thing it only needs refreshing this often.
+    static let refreshInterval: TimeInterval = 20
 
-    @Published private(set) var segments: [Segment] = []
-    @Published private(set) var current: ActivityKey?
+    // Not @Published: these change every sample, and redrawing everything every 2s
+    // is what made the app expensive. publish() refreshes the UI instead.
+    private(set) var segments: [Segment] = []
+    private(set) var current: ActivityKey?
     @Published private(set) var deniedBrowsers: [String] = []
     @Published private(set) var needsAccessibility = false
+
+    /// Everything the UI derives from today's segments, computed once per publish.
+    private struct Derived {
+        var totals: [(key: ActivityKey, seconds: TimeInterval)]
+        var totalTracked: TimeInterval
+        var focusStats: FocusStats
+        var summary: MacDaySummary
+        var websiteAverages: (days: Int, perDay: [(key: ActivityKey, seconds: TimeInterval)])
+    }
+    private var cache: Derived?
+    private var lastPublish = Date.distantPast
+    private var publishedKey: ActivityKey?
 
     private var day: Date
     /// Totals from previous days (they don't change, so loaded once per day).
@@ -81,8 +97,8 @@ final class Tracker: ObservableObject {
             segments = []
             history = Self.loadHistory(before: day)
             pastSummaries = Self.loadPastSummaries(before: day)
-        pastSummaries = Self.loadPastSummaries(before: day)
             current = nil
+            publish(at: now)
         }
 
         let idle = Self.secondsSinceLastInput()
@@ -100,6 +116,14 @@ final class Tracker: ObservableObject {
         if denied != deniedBrowsers { deniedBrowsers = denied }
         if ActivityProbe.accessibilityMissing != needsAccessibility { needsAccessibility = ActivityProbe.accessibilityMissing }
         if now.timeIntervalSince(lastSave) > 30 { save() }
+        if current != publishedKey || now.timeIntervalSince(lastPublish) >= Self.refreshInterval { publish(at: now) }
+    }
+
+    private func publish(at now: Date) {
+        cache = nil
+        objectWillChange.send()
+        lastPublish = now
+        publishedKey = current
     }
 
     private func record(_ key: ActivityKey?, at now: Date) {
@@ -141,17 +165,29 @@ final class Tracker: ObservableObject {
 
     // MARK: Stats
 
-    func totals(filter: (ActivityKey) -> Bool = { _ in true }) -> [(key: ActivityKey, seconds: TimeInterval)] {
+    private var derived: Derived {
+        if let cache { return cache }
         var totals: [ActivityKey: TimeInterval] = [:]
-        for s in segments where filter(s.key) { totals[s.key, default: 0] += s.duration }
-        return totals.map { ($0.key, $0.value) }.filter { $0.1 >= 1 }.sorted { $0.1 > $1.1 }
+        for s in segments { totals[s.key, default: 0] += s.duration }
+        let d = Derived(
+            totals: totals.map { ($0.key, $0.value) }.filter { $0.1 >= 1 }.sorted { $0.1 > $1.1 },
+            totalTracked: segments.reduce(0) { $0 + $1.duration },
+            focusStats: Self.focusStats(of: segments),
+            summary: Self.summary(day: day, segments: segments),
+            websiteAverages: computeWebsiteAverages(today: totals))
+        cache = d
+        return d
     }
 
-    var totalTracked: TimeInterval { segments.reduce(0) { $0 + $1.duration } }
+    func totals(filter: (ActivityKey) -> Bool = { _ in true }) -> [(key: ActivityKey, seconds: TimeInterval)] {
+        derived.totals.filter { filter($0.key) }
+    }
+
+    var totalTracked: TimeInterval { derived.totalTracked }
 
     /// A focus break = switching away from something you'd been on for under 5 minutes.
     /// Consecutive samples of the same thing are merged; switches across an idle/sleep gap don't count.
-    var focusStats: FocusStats { Self.focusStats(of: segments) }
+    var focusStats: FocusStats { derived.focusStats }
 
     static func focusStats(of segments: [Segment]) -> FocusStats {
         var stats = FocusStats()
@@ -198,8 +234,11 @@ final class Tracker: ObservableObject {
     /// Average seconds per day spent on each website, over the last 30 days that have data
     /// (today counts as one day, even though it isn't over yet).
     func dailyWebsiteAverages() -> (days: Int, perDay: [(key: ActivityKey, seconds: TimeInterval)]) {
-        var totals = history.totals
-        for s in segments { totals[s.key, default: 0] += s.duration }
+        derived.websiteAverages
+    }
+
+    private func computeWebsiteAverages(today: [ActivityKey: TimeInterval]) -> (days: Int, perDay: [(key: ActivityKey, seconds: TimeInterval)]) {
+        let totals = history.totals.merging(today, uniquingKeysWith: +)
         let days = history.days + (segments.isEmpty ? 0 : 1)
         guard days > 0 else { return (0, []) }
         let perDay = totals.filter { $0.key.isWebsite && $0.value >= 1 }
@@ -307,7 +346,7 @@ extension Tracker {
     }
 
     /// Past days plus today so far.
-    var allSummaries: [MacDaySummary] { pastSummaries + [Self.summary(day: day, segments: segments)] }
+    var allSummaries: [MacDaySummary] { pastSummaries + [derived.summary] }
 
     /// Upload past days that aren't in iCloud yet (e.g. first launch with sync).
     static func backfillCloud(before today: Date, lookback: Int = 30) {
